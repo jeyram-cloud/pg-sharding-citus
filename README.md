@@ -4,6 +4,8 @@ This lab is one PostgreSQL database spread across five machines, with a standby 
 
 The virtual machines run AlmaLinux 9 on VirtualBox. PostgreSQL is 19rc2. Citus is 15.0devel, built from source because the Citus 14.3 packages stop at PostgreSQL 18.
 
+First-time install, download links, and the build order are in [INSTALL.md](INSTALL.md).
+
 ## The idea in one picture
 
 A distributed table is cut into shards. This lab uses five shards, so each primary holds one shard. The standby is a full streaming copy of that primary. It is the machine that takes over during a maintenance window.
@@ -120,7 +122,7 @@ Leave the old powered-off VM `Citus_citus01` off while this lab runs. It uses th
 
 ## Bring the lab up
 
-From this directory:
+A new machine follows [INSTALL.md](INSTALL.md): install VirtualBox and Vagrant, clone this repository, then `vagrant up`. After the lab already exists, start it from this directory:
 
 ```bash
 ./pg_lab start
@@ -354,6 +356,7 @@ Opens `psql` on the coordinator as `postgres`, or runs one SQL statement. After 
 
 | Path | Role |
 | --- | --- |
+| `INSTALL.md` | Downloads and the first-time setup |
 | `Vagrantfile` | Ten VMs, addresses, and host ports |
 | `pg_lab` | The command wrapper on the Mac |
 | `vagrant-configs/citus-cluster.sh` | Creates `countries`, `customers`, and `orders` |

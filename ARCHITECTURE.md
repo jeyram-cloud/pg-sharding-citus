@@ -1,6 +1,6 @@
 # PostgreSQL 19 + Citus lab
 
-The short picture of this lab, and an explanation of every `./pg_lab` command, is in [README.md](README.md).
+The short picture of this lab, and an explanation of every `./pg_lab` command, is in [README.md](README.md). Downloads and the first-time setup are in [INSTALL.md](INSTALL.md).
 
 Five AlmaLinux 9 virtual machines on VirtualBox hold the shards. Five more machines are their streaming standbys. Each one runs PostgreSQL 19rc2 and Citus 15.0devel. Applications connect to the coordinator virtual IP `192.168.32.241`. Citus splits distributed tables into shards and places one shard on every primary, including the coordinator.
 
