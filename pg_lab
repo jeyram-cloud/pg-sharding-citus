@@ -1,0 +1,833 @@
+#!/usr/bin/env bash
+# Operate the pgcitus lab from the Mac.
+#
+# Rolling work visits workers first and the coordinator last:
+#   citus05 citus04 citus03 citus02 citus01
+#
+# After ./pg_lab ha-init, each shard group has a Patroni standby. Reboot,
+# stop, and maint move leadership to that standby before the node goes down.
+#
+#   ./pg_lab help
+#   ./pg_lab status
+#   ./pg_lab health
+#   ./pg_lab precheck
+#   ./pg_lab precheck --node citus01
+#   ./pg_lab start
+#   ./pg_lab start --node citus03
+#   ./pg_lab stop --yes
+#   ./pg_lab stop --yes --node citus05
+#   ./pg_lab reboot --yes
+#   ./pg_lab reboot --yes --node citus02
+#   ./pg_lab reboot --dry-run
+#   ./pg_lab os-patch --yes
+#   ./pg_lab os-patch --yes --no-reboot
+#   ./pg_lab os-patch --yes --node citus04
+#   ./pg_lab os-patch --dry-run
+#   ./pg_lab db-patch --yes
+#   ./pg_lab db-patch --yes --node citus03
+#   ./pg_lab db-patch --dry-run
+#   ./pg_lab restart-db --yes
+#   ./pg_lab restart-db --yes --node citus02
+#   ./pg_lab restart-db --dry-run
+#   ./pg_lab backup
+#   ./pg_lab backup /tmp/pgcitus-backups
+#   ./pg_lab backups
+#   ./pg_lab restore --yes backups/postgres-YYYYMMDD-HHMMSS.sql
+#   ./pg_lab shards
+#   ./pg_lab activity
+#   ./pg_lab ha
+#   ./pg_lab ha-init --yes
+#   ./pg_lab switchover --yes --node citus05
+#   ./pg_lab maint --yes --node citus05
+#   ./pg_lab logs
+#   ./pg_lab logs --node citus02
+#   ./pg_lab logs --node citus02 200
+#   ./pg_lab psql
+#   ./pg_lab psql -c 'SELECT count(*) FROM customers;'
+#
+# citus01 is the coordinator. citus02 citus03 citus04 citus05 are the workers.
+# citus01b through citus05b are the Patroni standbys.
+# --yes skips the confirmation prompt.
+# --node citus0N limits the action to one machine.
+# --dry-run prints the plan and changes nothing.
+# --no-reboot lets os-patch install packages and leave the reboot for later.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${ROOT}"
+
+PRIMARIES=(citus01 citus02 citus03 citus04 citus05)
+STANDBYS=(citus01b citus02b citus03b citus04b citus05b)
+NODES=("${PRIMARIES[@]}")
+STATUS_NODES=("${PRIMARIES[@]}" "${STANDBYS[@]}")
+# Workers first so the coordinator is the last machine to go down.
+ROLLING=(citus05 citus04 citus03 citus02 citus01)
+GROUPS_FILE="${ROOT}/vagrant-configs/ha/groups.tsv"
+COORD_NODE=""
+
+YES=0
+DRY_RUN=0
+NO_REBOOT=0
+NODE=""
+CMD=""
+EXTRA=()
+
+usage() {
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    --yes) YES=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --no-reboot) NO_REBOOT=1 ;;
+    --node)
+      NODE="${2:-}"
+      shift
+      ;;
+    --)
+      shift
+      EXTRA+=("$@")
+      break
+      ;;
+    *)
+      if [[ -z "${CMD}" ]]; then
+        CMD="$1"
+      else
+        EXTRA+=("$1")
+      fi
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "${CMD}" ]]; then
+  usage
+  exit 2
+fi
+
+valid_node() {
+  local name="$1"
+  local n
+  for n in "${STATUS_NODES[@]}"; do
+    [[ "${n}" == "${name}" ]] && return 0
+  done
+  return 1
+}
+
+if [[ -n "${NODE}" ]] && ! valid_node "${NODE}"; then
+  echo "unknown node: ${NODE}" >&2
+  echo "known nodes: ${STATUS_NODES[*]}" >&2
+  exit 2
+fi
+
+targets=()
+if [[ -n "${NODE}" ]]; then
+  targets=("${NODE}")
+else
+  targets=("${ROLLING[@]}")
+fi
+
+run_guest() {
+  local node="$1"
+  local script="$2"
+  cat "${script}" | vagrant ssh "${node}" -c 'sudo bash -s'
+}
+
+guest_result() {
+  local node="$1"
+  local file="$2"
+  vagrant ssh "${node}" -c "cat ${file}"
+}
+
+coordinator_node() {
+  local n
+  if [[ -n "${COORD_NODE}" ]]; then
+    printf '%s\n' "${COORD_NODE}"
+    return 0
+  fi
+  if [[ -f "${GROUPS_FILE}" ]]; then
+    for n in citus01 citus01b; do
+      if vagrant ssh "${n}" -c 'curl -sf -o /dev/null --max-time 2 http://127.0.0.1:8008/primary' >/dev/null 2>&1; then
+        COORD_NODE="${n}"
+        printf '%s\n' "${COORD_NODE}"
+        return 0
+      fi
+    done
+  fi
+  COORD_NODE="citus01"
+  printf '%s\n' "${COORD_NODE}"
+}
+
+coordinator_sql() {
+  local sql="$1"
+  local node
+  node="$(coordinator_node)"
+  printf '%s\n' "${sql}" | vagrant ssh "${node}" -c 'sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 -tA'
+}
+
+partner_of() {
+  case "$1" in
+    citus01) echo citus01b ;;
+    citus02) echo citus02b ;;
+    citus03) echo citus03b ;;
+    citus04) echo citus04b ;;
+    citus05) echo citus05b ;;
+    citus01b) echo citus01 ;;
+    citus02b) echo citus02 ;;
+    citus03b) echo citus03 ;;
+    citus04b) echo citus04 ;;
+    citus05b) echo citus05 ;;
+    *) return 1 ;;
+  esac
+}
+
+group_of() {
+  local name="$1"
+  [[ -f "${GROUPS_FILE}" ]] || return 1
+  awk -v n="${name}" '$1 == n { print $2; exit }' "${GROUPS_FILE}"
+}
+
+ha_installed() {
+  [[ -f "${GROUPS_FILE}" ]]
+}
+
+is_patroni_leader() {
+  vagrant ssh "$1" -c 'curl -sf -o /dev/null --max-time 2 http://127.0.0.1:8008/primary' >/dev/null 2>&1
+}
+
+is_patroni_replica() {
+  local body
+  # noloadbalance standbys return 503 on /replica while they are streaming.
+  body="$(vagrant ssh "$1" -c 'curl -sf --max-time 2 http://127.0.0.1:8008/patroni' 2>/dev/null || true)"
+  printf '%s' "${body}" | grep -q '"role": "replica"' \
+    && printf '%s' "${body}" | grep -q '"replication_state": "streaming"'
+}
+
+patronictl_on() {
+  local node="$1"
+  shift
+  vagrant ssh "${node}" -c "sudo env PATH=/usr/local/bin:/usr/sbin:/usr/bin:/bin patronictl -c /etc/patroni.yml $*"
+}
+
+wait_patroni_role() {
+  local node="$1"
+  local path="$2"
+  local attempt body
+  for attempt in $(seq 1 40); do
+    if [[ "${path}" == "/replica" ]]; then
+      body="$(vagrant ssh "${node}" -c 'curl -sf --max-time 2 http://127.0.0.1:8008/patroni' 2>/dev/null || true)"
+      if printf '%s' "${body}" | grep -q '"role": "replica"' && printf '%s' "${body}" | grep -q '"replication_state": "streaming"'; then
+        echo "${node}: replica is streaming"
+        return 0
+      fi
+    elif vagrant ssh "${node}" -c "curl -sf -o /dev/null --max-time 2 http://127.0.0.1:8008${path}" >/dev/null 2>&1; then
+      echo "${node}: ${path} is ready"
+      return 0
+    fi
+    echo "waiting for ${node} ${path} (${attempt}/40)"
+    sleep 5
+  done
+  echo "${node} did not reach ${path}" >&2
+  return 1
+}
+
+move_leadership() {
+  local node="$1"
+  local partner group
+  ha_installed || return 0
+  if ! is_patroni_leader "${node}"; then
+    echo "${node} is not the Patroni leader"
+    return 0
+  fi
+  partner="$(partner_of "${node}")"
+  group="$(group_of "${node}")"
+  if [[ -z "${group}" ]]; then
+    echo "no Citus group for ${node} in ${GROUPS_FILE}" >&2
+    return 1
+  fi
+  if ! is_patroni_replica "${partner}"; then
+    echo "${partner} is not streaming, so ${node} stays leader" >&2
+    return 1
+  fi
+  echo "moving group ${group} from ${node} to ${partner}"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    return 0
+  fi
+  patronictl_on citus01 "switchover pgcitus --group ${group} --leader ${node} --candidate ${partner} --force"
+  COORD_NODE=""
+  wait_patroni_role "${partner}" /primary
+  wait_patroni_role "${node}" /replica
+  coordinator_sql "SELECT count(*) FROM customers;" >/dev/null
+  echo "${partner} is leader and the coordinator still reads customers"
+}
+
+node_state() {
+  local node="$1"
+  vagrant status "${node}" | awk -v n="${node}" '$1 == n { print $2; exit }'
+}
+
+confirm() {
+  local message="$1"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    echo "dry-run: ${message}"
+    return 1
+  fi
+  if [[ "${YES}" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "Re-run with --yes to continue: ${message}" >&2
+    exit 1
+  fi
+  local answer
+  read -r -p "${message} [y/N] " answer
+  [[ "${answer}" == "y" || "${answer}" == "Y" ]]
+}
+
+lock_mutation() {
+  local lock="/tmp/pgcitus-cluster.lock"
+  if ! mkdir "${lock}" 2>/dev/null; then
+    echo "another pg_lab change is already running (${lock})" >&2
+    exit 1
+  fi
+  trap 'rmdir /tmp/pgcitus-cluster.lock' EXIT
+}
+
+wait_for_postgres() {
+  local node="$1"
+  local attempt
+  for attempt in $(seq 1 36); do
+    if vagrant ssh "${node}" -c 'sudo -u postgres /usr/pgsql-19/bin/pg_isready -q'; then
+      echo "${node}: PostgreSQL is accepting connections"
+      return 0
+    fi
+    echo "waiting for PostgreSQL on ${node} (${attempt}/36)"
+    sleep 5
+  done
+  echo "PostgreSQL did not come back on ${node}" >&2
+  return 1
+}
+
+check_node_in_cluster() {
+  local node="$1"
+  local active
+  active="$(coordinator_sql "SELECT isactive FROM pg_dist_node WHERE nodename = '${node}';" | tr -d '[:space:]')"
+  if [[ "${active}" == "f" ]]; then
+    echo "${node} is registered in Citus but inactive" >&2
+    return 1
+  fi
+  coordinator_sql "SELECT count(*) FROM customers;" >/dev/null
+  echo "${node}: coordinator still queries the cluster"
+}
+
+print_table() {
+  awk '
+    function rep(ch, n,    s, i) {
+      s = ""
+      for (i = 0; i < n; i++) s = s ch
+      return s
+    }
+    BEGIN { FS = "|" }
+    /^[[:space:]]*$/ { next }
+    {
+      rows++
+      if (NF > cols) cols = NF
+      for (i = 1; i <= NF; i++) {
+        cell[rows, i] = $i
+        if (length($i) > width[i]) width[i] = length($i)
+      }
+    }
+    END {
+      if (rows == 0) exit 0
+      border = "+"
+      for (i = 1; i <= cols; i++) border = border rep("-", width[i] + 2) "+"
+      print border
+      for (r = 1; r <= rows; r++) {
+        line = "|"
+        for (i = 1; i <= cols; i++) {
+          line = line " " cell[r, i] rep(" ", width[i] - length(cell[r, i])) " |"
+        }
+        print line
+        print border
+      }
+    }
+  '
+}
+
+fact_value() {
+  local facts="$1"
+  local key="$2"
+  printf '%s\n' "${facts}" | awk -F= -v k="${key}" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'
+}
+
+cmd_status() {
+  local table="NODE|STATE|OS|KERNEL|POSTGRES|PG|CITUS|RPM|DISK"
+  local node state facts
+  for node in "${STATUS_NODES[@]}"; do
+    state="$(node_state "${node}")"
+    if [[ "${state}" != "running" ]]; then
+      table+=$'\n'"${node}|${state}|-|-|-|-|-|-|-"
+      continue
+    fi
+    facts="$(run_guest "${node}" "${ROOT}/vagrant-configs/ops/facts.sh")"
+    table+=$'\n'"${node}|${state}|$(fact_value "${facts}" os)|$(fact_value "${facts}" kernel)|$(fact_value "${facts}" postgres)|$(fact_value "${facts}" pgver)|$(fact_value "${facts}" citus)|$(fact_value "${facts}" rpm)|$(fact_value "${facts}" disk)"
+  done
+  printf '%s\n' "${table}" | print_table
+}
+
+coordinator_table() {
+  local sql="$1"
+  local node
+  node="$(coordinator_node)"
+  printf '%s\n' "${sql}" | vagrant ssh "${node}" -c 'sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 -P pager=off -P footer=off -A -F "|"' | print_table
+}
+
+cmd_health() {
+  coordinator_table "SELECT nodeid, nodename, isactive, shouldhaveshards
+                      FROM pg_dist_node
+                      ORDER BY nodeid;"
+  echo
+  coordinator_table "SELECT current_setting('server_version') AS server_version,
+                            citus_version();"
+  echo
+  coordinator_table "SELECT 'customers' AS table_name, count(*) AS row_count FROM customers
+                      UNION ALL
+                      SELECT 'orders', count(*) FROM orders
+                      UNION ALL
+                      SELECT 'countries', count(*) FROM countries
+                      ORDER BY table_name;"
+  local active_count
+  active_count="$(coordinator_sql "SELECT count(*) FROM pg_dist_node WHERE isactive AND noderole = 'primary';" | tr -d '[:space:]')"
+  if [[ "${active_count}" != "5" ]]; then
+    echo "expected 5 active primary nodes, found ${active_count}" >&2
+    exit 1
+  fi
+}
+
+cmd_precheck() {
+  local table="NODE|STATE|POSTGRES|FREE_KB|CLUSTER"
+  local node state facts free_kb cluster
+  for node in "${targets[@]}"; do
+    state="$(node_state "${node}")"
+    if [[ "${state}" != "running" ]]; then
+      table+=$'\n'"${node}|${state}|-|-|-"
+      printf '%s\n' "${table}" | print_table
+      echo "${node} is ${state}" >&2
+      exit 1
+    fi
+    if ! facts="$(run_guest "${node}" "${ROOT}/vagrant-configs/ops/precheck.sh")"; then
+      printf '%s\n' "${table}" | print_table
+      exit 1
+    fi
+    free_kb="$(fact_value "${facts}" free_kb)"
+    pg_state="$(fact_value "${facts}" postgres_service)"
+    [[ -n "${pg_state}" ]] || pg_state="active"
+    cluster="$(coordinator_sql "SELECT CASE WHEN isactive THEN 'active' ELSE 'inactive' END
+                                FROM pg_dist_node WHERE nodename = '${node}';" | tr -d '[:space:]')"
+    if [[ -z "${cluster}" ]]; then
+      cluster="standby"
+    fi
+    table+=$'\n'"${node}|${state}|${pg_state}|${free_kb}|${cluster}"
+    if [[ "${cluster}" == "inactive" ]]; then
+      printf '%s\n' "${table}" | print_table
+      echo "${node} is not an active Citus node" >&2
+      exit 1
+    fi
+  done
+  printf '%s\n' "${table}" | print_table
+}
+
+cmd_start() {
+  local node list=()
+  if [[ -n "${NODE}" ]]; then
+    list=("${NODE}")
+  else
+    local n state
+    for n in "${STATUS_NODES[@]}"; do
+      state="$(node_state "${n}")"
+      if [[ "${state}" != "not" && -n "${state}" ]]; then
+        list+=("${n}")
+      fi
+    done
+  fi
+  # Boot every VM before waiting on PostgreSQL. Patroni will not open
+  # the database until etcd has a quorum, and that quorum needs two of
+  # citus01, citus02, and citus03.
+  for node in "${list[@]}"; do
+    echo "starting ${node}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      continue
+    fi
+    vagrant up "${node}" --no-provision
+  done
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    for node in "${list[@]}"; do
+      wait_for_postgres "${node}"
+    done
+  fi
+  if [[ "${DRY_RUN}" -eq 0 && -z "${NODE}" ]] && ha_installed; then
+    local group
+    group="$(group_of citus01 || true)"
+    if [[ -n "${group}" ]]; then
+      while IFS= read -r group; do
+        [[ -n "${group}" ]] || continue
+        patronictl_on citus01 "resume pgcitus --group ${group}" || true
+      done < <(awk '{ print $2 }' "${GROUPS_FILE}" | sort -u)
+    fi
+  fi
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    cmd_health
+  fi
+}
+
+cmd_stop() {
+  local list=()
+  if [[ -n "${NODE}" ]]; then
+    list=("${NODE}")
+    confirm "Halt ${NODE}" || return 0
+  else
+    confirm "Halt every pgcitus node" || return 0
+    local n state
+    for n in "${STANDBYS[@]}" "${PRIMARIES[@]}"; do
+      state="$(node_state "${n}")"
+      if [[ "${state}" == "running" || "${state}" == "saved" ]]; then
+        list+=("${n}")
+      fi
+    done
+  fi
+  lock_mutation
+  if [[ -n "${NODE}" ]]; then
+    move_leadership "${NODE}"
+  elif ha_installed; then
+    local group
+    while IFS= read -r group; do
+      [[ -n "${group}" ]] || continue
+      echo "pausing Patroni group ${group}"
+      if [[ "${DRY_RUN}" -eq 0 ]]; then
+        patronictl_on citus01 "pause pgcitus --group ${group} --wait" || true
+      fi
+    done < <(awk '{ print $2 }' "${GROUPS_FILE}" | sort -u)
+  fi
+  local node
+  for node in "${list[@]}"; do
+    echo "halting ${node}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      continue
+    fi
+    vagrant halt "${node}"
+  done
+}
+
+reboot_one() {
+  local node="$1"
+  move_leadership "${node}"
+  echo "rebooting ${node}"
+  vagrant reload "${node}" --no-provision
+  wait_for_postgres "${node}"
+  check_node_in_cluster "${node}"
+}
+
+cmd_reboot() {
+  echo "reboot order: ${targets[*]}"
+  confirm "Reboot ${targets[*]}" || return 0
+  lock_mutation
+  cmd_precheck
+  local node
+  for node in "${targets[@]}"; do
+    reboot_one "${node}"
+  done
+  cmd_health
+}
+
+cmd_os_patch() {
+  echo "os-patch order: ${targets[*]}"
+  echo "PostgreSQL packages are left unchanged. A node reboots when AlmaLinux asks for one."
+  confirm "Apply OS patches on ${targets[*]}" || return 0
+  lock_mutation
+  cmd_precheck
+  local node result
+  for node in "${targets[@]}"; do
+    run_guest "${node}" "${ROOT}/vagrant-configs/ops/os-patch.sh"
+    result="$(guest_result "${node}" /var/tmp/pgcitus-os-patch.result | awk -F= '/^REBOOT_REQUIRED=/ { print $2 }' | tr -d '[:space:]')"
+    if [[ "${result}" != "yes" && "${result}" != "no" ]]; then
+      echo "could not read reboot result for ${node}: '${result}'" >&2
+      exit 1
+    fi
+    echo "${node}: REBOOT_REQUIRED=${result}"
+    if [[ "${result}" == "yes" && "${NO_REBOOT}" -eq 0 ]]; then
+      reboot_one "${node}"
+    elif [[ "${result}" == "yes" ]]; then
+      echo "${node}: reboot is still required"
+    fi
+  done
+  cmd_health
+}
+
+rebuild_citus_and_restart() {
+  local node="$1"
+  echo "${node}: rebuilding Citus and restarting PostgreSQL"
+  cat "${ROOT}/vagrant-configs/citus-pg19-install.sh" | vagrant ssh "${node}" -c 'sudo env FORCE_CITUS_REBUILD=1 bash -s'
+  wait_for_postgres "${node}"
+  check_node_in_cluster "${node}"
+}
+
+cmd_db_patch() {
+  echo "db-patch order: ${targets[*]}"
+  echo "Updates postgresql19 packages. Citus is rebuilt only when an RPM changes."
+  confirm "Apply database patches on ${targets[*]}" || return 0
+  lock_mutation
+  cmd_precheck
+  local node result
+  for node in "${targets[@]}"; do
+    run_guest "${node}" "${ROOT}/vagrant-configs/ops/db-patch.sh"
+    result="$(guest_result "${node}" /var/tmp/pgcitus-db-patch.result | awk -F= '/^PG_PATCH_RESULT=/ { print $2 }' | tr -d '[:space:]')"
+    if [[ "${result}" != "CHANGED" && "${result}" != "UNCHANGED" ]]; then
+      echo "could not read database patch result for ${node}: '${result}'" >&2
+      exit 1
+    fi
+    echo "${node}: PG_PATCH_RESULT=${result}"
+    if [[ "${result}" == "CHANGED" ]]; then
+      rebuild_citus_and_restart "${node}"
+    else
+      echo "${node}: PostgreSQL packages are already current"
+    fi
+  done
+  cmd_health
+}
+
+cmd_restart_db() {
+  echo "restart-db order: ${targets[*]}"
+  confirm "Restart PostgreSQL on ${targets[*]}" || return 0
+  lock_mutation
+  cmd_precheck
+  local node group
+  for node in "${targets[@]}"; do
+    if ha_installed && vagrant ssh "${node}" -c 'systemctl is-active --quiet patroni'; then
+      group="$(group_of "${node}")"
+      echo "restarting Patroni member ${node} in group ${group}"
+      patronictl_on citus01 "restart pgcitus --group ${group} --member ${node} --force"
+    else
+      echo "restarting postgresql-19 on ${node}"
+      vagrant ssh "${node}" -c 'sudo systemctl restart postgresql-19'
+    fi
+    wait_for_postgres "${node}"
+    check_node_in_cluster "${node}"
+  done
+  cmd_health
+}
+
+cmd_backup() {
+  local dir="${ROOT}/backups"
+  if [[ "${EXTRA[0]:-}" != "" ]]; then
+    dir="${EXTRA[0]}"
+  fi
+  mkdir -p "${dir}"
+  local outfile="${dir}/postgres-$(date +%Y%m%d-%H%M%S).sql"
+  echo "writing ${outfile}"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    return 0
+  fi
+  vagrant ssh citus01 -c 'sudo -u postgres pg_dump -d postgres --format=plain --no-owner' > "${outfile}"
+  if ! head -n 20 "${outfile}" | grep -q 'PostgreSQL database dump'; then
+    echo "backup file does not look like a pg_dump" >&2
+    exit 1
+  fi
+  printf '%s\n' "FILE|SIZE" "${outfile}|$(du -h "${outfile}" | awk '{ print $1 }')" | print_table
+}
+
+cmd_backups() {
+  local dir="${ROOT}/backups"
+  if [[ "${EXTRA[0]:-}" != "" ]]; then
+    dir="${EXTRA[0]}"
+  fi
+  local table="FILE|SIZE|MODIFIED"
+  local found=0
+  local file
+  if [[ -d "${dir}" ]]; then
+    for file in "${dir}"/postgres-*.sql; do
+      [[ -f "${file}" ]] || continue
+      found=1
+      table+=$'\n'"$(basename "${file}")|$(du -h "${file}" | awk '{ print $1 }')|$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "${file}")"
+    done
+  fi
+  if [[ "${found}" -eq 0 ]]; then
+    table+=$'\n'"none|-|-"
+  fi
+  printf '%s\n' "${table}" | print_table
+}
+
+cmd_restore() {
+  local file="${EXTRA[0]:-}"
+  if [[ -z "${file}" || ! -f "${file}" ]]; then
+    echo "usage: ./pg_lab restore --yes backups/postgres-YYYYMMDD-HHMMSS.sql" >&2
+    exit 2
+  fi
+  if ! head -n 20 "${file}" | grep -q 'PostgreSQL database dump'; then
+    echo "${file} is not a pg_dump file" >&2
+    exit 1
+  fi
+  confirm "Replace orders, customers, and countries from ${file}" || return 0
+  lock_mutation
+  coordinator_sql "DROP TABLE IF EXISTS orders, customers, countries CASCADE;"
+  cat "${file}" | vagrant ssh citus01 -c 'sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 -P pager=off'
+  coordinator_sql "ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_country_fk;"
+  coordinator_sql "ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_customer_fk;"
+  coordinator_sql "SELECT create_reference_table('countries');"
+  coordinator_sql "SELECT create_distributed_table('customers', 'customer_id');"
+  coordinator_sql "SELECT create_distributed_table('orders', 'customer_id', colocate_with => 'customers');"
+  coordinator_sql "ALTER TABLE customers ADD CONSTRAINT customers_country_fk FOREIGN KEY (country_code) REFERENCES countries (country_code);"
+  coordinator_sql "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers (customer_id);"
+  cmd_health
+  cmd_shards
+}
+
+cmd_shards() {
+  coordinator_table "SELECT s.logicalrelid::regclass::text AS table_name,
+                            p.nodename,
+                            count(DISTINCT p.shardid) AS shards
+                     FROM pg_dist_shard s
+                     JOIN pg_dist_shard_placement p USING (shardid)
+                     GROUP BY 1, 2
+                     ORDER BY 1, 2;"
+  echo
+  coordinator_table "SELECT p.nodename, r.result AS customers
+                     FROM run_command_on_shards('customers', \$\$SELECT count(*) FROM %s\$\$) r
+                     JOIN pg_dist_shard_placement p ON p.shardid = r.shardid
+                     ORDER BY p.nodename;"
+}
+
+cmd_activity() {
+  coordinator_table "SELECT COALESCE(state, 'none') AS state, count(*) AS sessions
+                     FROM pg_stat_activity
+                     GROUP BY 1
+                     ORDER BY 2 DESC;"
+  echo
+  coordinator_table "SELECT pid, usename, client_addr::text AS client_addr, left(query, 80) AS query
+                     FROM pg_stat_activity
+                     WHERE state = 'active'
+                       AND pid <> pg_backend_pid()
+                     ORDER BY pid;"
+}
+
+cmd_logs() {
+  local node="${NODE:-citus01}"
+  local lines="${EXTRA[0]:-80}"
+  if ! [[ "${lines}" =~ ^[0-9]+$ ]]; then
+    echo "logs expects a numeric line count, got: ${lines}" >&2
+    exit 2
+  fi
+  vagrant ssh "${node}" -c "if systemctl cat patroni >/dev/null 2>&1; then sudo journalctl -u patroni -n ${lines} --no-pager; else sudo journalctl -u postgresql-19 -n ${lines} --no-pager; fi"
+}
+
+cmd_ha() {
+  local table="NODE|GROUP|ROLE|STATE"
+  local node group role state
+  if ! ha_installed; then
+    echo "Patroni is not initialized. Run ./pg_lab ha-init --yes" >&2
+    exit 1
+  fi
+  for node in "${STATUS_NODES[@]}"; do
+    group="$(group_of "${node}")"
+    state="$(node_state "${node}")"
+    if [[ "${state}" != "running" ]]; then
+      table+=$'\n'"${node}|${group}|${state}|-"
+      continue
+    fi
+    role="$(vagrant ssh "${node}" -c 'curl -sf --max-time 2 http://127.0.0.1:8008/patroni' 2>/dev/null | python3 -c 'import json,sys
+try:
+    data=json.load(sys.stdin)
+    print(data.get("role","?"), data.get("state","?"), sep="|")
+except Exception:
+    print("down|down")' || true)"
+    if [[ -z "${role}" ]]; then
+      role="down|down"
+    fi
+    table+=$'\n'"${node}|${group}|${role}"
+  done
+  printf '%s\n' "${table}" | print_table
+  echo
+  local vip_table="VIP|SERVER"
+  local vip server
+  for vip in citus01-vip citus02-vip citus03-vip citus04-vip citus05-vip; do
+    server="$(vagrant ssh "$(coordinator_node)" -c "sudo -u postgres psql -d postgres -h ${vip} -tAc 'SELECT inet_server_addr();'" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -n "${server}" ]] || server="-"
+    vip_table+=$'\n'"${vip}|${server}"
+  done
+  printf '%s\n' "${vip_table}" | print_table
+}
+
+cmd_ha_init() {
+  confirm "Put PostgreSQL under Patroni and clone a standby for every shard" || return 0
+  lock_mutation
+  bash "${ROOT}/vagrant-configs/ha/bootstrap.sh"
+}
+
+cmd_switchover() {
+  if [[ -z "${NODE}" ]]; then
+    echo "usage: ./pg_lab switchover --yes --node citus05" >&2
+    exit 2
+  fi
+  confirm "Move leadership from ${NODE} to $(partner_of "${NODE}")" || return 0
+  lock_mutation
+  move_leadership "${NODE}"
+  cmd_health
+}
+
+cmd_maint() {
+  if [[ -z "${NODE}" ]]; then
+    echo "usage: ./pg_lab maint --yes --node citus05" >&2
+    exit 2
+  fi
+  confirm "Move ${NODE} to standby so its partner serves the shard" || return 0
+  lock_mutation
+  move_leadership "${NODE}"
+  cmd_health
+  echo "${NODE} is the standby. Its partner serves this shard until you switch back."
+}
+
+cmd_psql() {
+  local sql=""
+  if [[ "${EXTRA[0]:-}" == "-c" ]]; then
+    sql="${EXTRA[1]:-}"
+  elif [[ ${#EXTRA[@]} -gt 0 ]]; then
+    sql="${EXTRA[*]}"
+  fi
+  if [[ -z "${sql}" ]]; then
+    exec vagrant ssh citus01 -- -t sudo -u postgres psql -d postgres
+  fi
+  printf '%s\n' "${sql}" | vagrant ssh citus01 -c 'sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1'
+}
+
+case "${CMD}" in
+  status) cmd_status ;;
+  health) cmd_health ;;
+  precheck) cmd_precheck ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  reboot) cmd_reboot ;;
+  os-patch) cmd_os_patch ;;
+  db-patch) cmd_db_patch ;;
+  restart-db) cmd_restart_db ;;
+  backup) cmd_backup ;;
+  backups) cmd_backups ;;
+  restore) cmd_restore ;;
+  shards) cmd_shards ;;
+  activity) cmd_activity ;;
+  ha) cmd_ha ;;
+  ha-init) cmd_ha_init ;;
+  switchover) cmd_switchover ;;
+  maint) cmd_maint ;;
+  logs) cmd_logs ;;
+  psql) cmd_psql ;;
+  *)
+    echo "unknown command: ${CMD}" >&2
+    usage
+    exit 2
+    ;;
+esac
